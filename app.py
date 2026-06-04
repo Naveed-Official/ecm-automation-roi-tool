@@ -33,6 +33,8 @@ class AutomationScenarioInputs:
     workflow_automation_level: str
     data_integration_level: str
     approval_automation_level: str
+    upfront_investment: float
+    annual_operating_cost: float
 
 
 @dataclass
@@ -43,8 +45,40 @@ class InvestmentInputs:
     training_cost: float
     internal_project_effort_cost: float
     annual_maintenance_cost: float
+    internal_support_cost: float
     analysis_horizon_years: int
     discount_rate_pct: float
+
+
+SCENARIOS = {
+    "Conservative": {
+        "engineering_effort_reduction_pct": 30.0,
+        "manager_effort_reduction_pct": 25.0,
+        "admin_effort_reduction_pct": 40.0,
+        "rework_reduction_pct": 20.0,
+        "cycle_time_reduction_pct": 30.0,
+        "upfront_investment": 150000.0,
+        "annual_operating_cost": 75000.0,
+    },
+    "Base Case": {
+        "engineering_effort_reduction_pct": 45.0,
+        "manager_effort_reduction_pct": 40.0,
+        "admin_effort_reduction_pct": 55.0,
+        "rework_reduction_pct": 40.0,
+        "cycle_time_reduction_pct": 50.0,
+        "upfront_investment": 215000.0,
+        "annual_operating_cost": 111600.0,
+    },
+    "Optimistic": {
+        "engineering_effort_reduction_pct": 65.0,
+        "manager_effort_reduction_pct": 60.0,
+        "admin_effort_reduction_pct": 75.0,
+        "rework_reduction_pct": 65.0,
+        "cycle_time_reduction_pct": 75.0,
+        "upfront_investment": 350000.0,
+        "annual_operating_cost": 160000.0,
+    },
+}
 
 
 # =============================
@@ -56,6 +90,10 @@ def eur(value: float) -> str:
 
 def pct(value: float) -> str:
     return f"{value:.1f}%"
+
+
+def number_or_na(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:,.0f}"
 
 
 def level_badge(label: str) -> str:
@@ -72,6 +110,95 @@ def automation_maturity_score(workflow: str, data: str, approval: str) -> tuple[
     score = (mapping[workflow] + mapping[data] + mapping[approval]) / 3
     label = "Low" if score < 1.7 else "Medium" if score < 2.5 else "High"
     return score, label
+
+
+def annuity_factor(discount_rate_pct: float, horizon_years: int) -> float:
+    # Chapter 5 formula: A = (1 - (1+r)^(-T_h)) / r
+    r = discount_rate_pct / 100
+    if horizon_years <= 0:
+        return 0
+    if r == 0:
+        return float(horizon_years)
+    return (1 - (1 + r) ** (-horizon_years)) / r
+
+
+def calculate_operating_cost(inv: InvestmentInputs) -> float:
+    # C_op = software license + annual maintenance + internal support.
+    return inv.software_license_cost + inv.annual_maintenance_cost + inv.internal_support_cost
+
+
+def manual_components_per_change(m: ManualProcessInputs) -> dict:
+    engineering = m.engineering_hours_per_change * m.engineer_hourly_rate
+    manager = m.manager_hours_per_change * m.manager_hourly_rate
+    admin = m.admin_hours_per_change * m.admin_hourly_rate
+    rework = (m.rework_rate_pct / 100) * m.rework_hours_per_change * m.engineer_hourly_rate
+    delay = m.delay_cost_per_day * m.avg_cycle_time_days
+    return {
+        "engineering": engineering,
+        "manager": manager,
+        "admin": admin,
+        "rework": rework,
+        "delay": delay,
+    }
+
+
+def savings_per_change(m: ManualProcessInputs, a: AutomationScenarioInputs, include_delay: bool) -> dict:
+    manual = manual_components_per_change(m)
+    engineering = manual["engineering"] * a.engineering_effort_reduction_pct / 100
+    manager = manual["manager"] * a.manager_effort_reduction_pct / 100
+    admin = manual["admin"] * a.admin_effort_reduction_pct / 100
+    rework = manual["rework"] * a.rework_reduction_pct / 100
+    delay = manual["delay"] * a.cycle_time_reduction_pct / 100 if include_delay else 0
+    return {
+        "engineering": engineering,
+        "manager": manager,
+        "admin": admin,
+        "rework": rework,
+        "delay": delay,
+        "total": engineering + manager + admin + rework + delay,
+    }
+
+
+def calculate_model(m: ManualProcessInputs, a: AutomationScenarioInputs, inv: InvestmentInputs, include_delay: bool) -> dict:
+    # Full model includes delay. Labour-only net model excludes delay but still includes C_op.
+    manual = manual_components_per_change(m)
+    spc = savings_per_change(m, a, include_delay=include_delay)
+    manual_per_change = manual["engineering"] + manual["manager"] + manual["admin"] + manual["rework"]
+    if include_delay:
+        manual_per_change += manual["delay"]
+
+    manual_annual_cost = m.changes_per_year * manual_per_change
+    gross_process_savings = m.changes_per_year * spc["total"]
+    automated_annual_cost = manual_annual_cost - gross_process_savings + a.annual_operating_cost
+    annual_savings = manual_annual_cost - automated_annual_cost
+
+    horizon = inv.analysis_horizon_years
+    a_factor = annuity_factor(inv.discount_rate_pct, horizon)
+    roi_pct = (((annual_savings * horizon) - a.upfront_investment) / a.upfront_investment * 100) if a.upfront_investment > 0 else 0
+    payback_years = a.upfront_investment / annual_savings if annual_savings > 0 else None
+    npv = -a.upfront_investment + annual_savings * a_factor
+    tco_manual = manual_annual_cost * horizon
+    tco_automated = a.upfront_investment + automated_annual_cost * horizon
+
+    if spc["total"] <= 0 or a_factor <= 0:
+        break_even_changes = None
+    else:
+        break_even_changes = (a.upfront_investment + a.annual_operating_cost * a_factor) / (spc["total"] * a_factor)
+
+    return {
+        "manual_annual_cost": manual_annual_cost,
+        "automated_annual_cost": automated_annual_cost,
+        "gross_process_savings": gross_process_savings,
+        "annual_savings": annual_savings,
+        "roi_pct": roi_pct,
+        "payback_years": payback_years,
+        "npv": npv,
+        "tco_manual": tco_manual,
+        "tco_automated": tco_automated,
+        "tco_saving": tco_manual - tco_automated,
+        "break_even_changes": break_even_changes,
+        "saving_per_change": spc["total"],
+    }
 
 
 def calculate_manual_costs(m: ManualProcessInputs) -> dict:
@@ -139,7 +266,7 @@ def calculate_automated_costs(
         + automated_admin_cost
         + automated_rework_cost
         + automated_delay_cost
-        + inv.annual_maintenance_cost
+        + a.annual_operating_cost
     )
 
     annual_savings = manual["total_manual_cost"] - total_automated_operating_cost
@@ -156,9 +283,9 @@ def calculate_automated_costs(
 
 
 def calculate_investment_total(inv: InvestmentInputs) -> float:
+    # I_0 excludes recurring software license, annual maintenance, and internal support.
     return (
-        inv.software_license_cost
-        + inv.implementation_cost
+        inv.implementation_cost
         + inv.integration_cost
         + inv.training_cost
         + inv.internal_project_effort_cost
@@ -168,30 +295,26 @@ def calculate_investment_total(inv: InvestmentInputs) -> float:
 def calculate_financials(m: ManualProcessInputs, a: AutomationScenarioInputs, inv: InvestmentInputs) -> dict:
     manual = calculate_manual_costs(m)
     automated = calculate_automated_costs(m, a, inv)
-    upfront_investment = calculate_investment_total(inv)
+    full_model = calculate_model(m, a, inv, include_delay=True)
+    labour_model = calculate_model(m, a, inv, include_delay=False)
+    upfront_investment = a.upfront_investment
 
-    annual_savings = automated["annual_savings"]
-    roi_pct = ((annual_savings - upfront_investment) / upfront_investment * 100) if upfront_investment > 0 else 0
-    payback_months = (upfront_investment / (annual_savings / 12)) if annual_savings > 0 else None
-
-    discount_rate = inv.discount_rate_pct / 100
-    cash_flows = [-upfront_investment]
-    npv = -upfront_investment
-    for year in range(1, inv.analysis_horizon_years + 1):
-        annual_net_benefit = annual_savings
-        cash_flows.append(annual_net_benefit)
-        npv += annual_net_benefit / ((1 + discount_rate) ** year)
-
-    tco_manual = manual["total_manual_cost"] * inv.analysis_horizon_years
-    tco_automated = upfront_investment + automated["total_automated_operating_cost"] * inv.analysis_horizon_years
+    annual_savings = full_model["annual_savings"]
+    roi_pct = full_model["roi_pct"]
+    payback_years = full_model["payback_years"]
+    payback_months = payback_years * 12 if payback_years is not None else None
+    npv = full_model["npv"]
+    tco_manual = full_model["tco_manual"]
+    tco_automated = full_model["tco_automated"]
+    cash_flows = [-upfront_investment] + [annual_savings] * inv.analysis_horizon_years
 
     if annual_savings <= 0:
         decision = "No-Go"
         rationale = "Automation does not generate positive annual savings under the current assumptions."
-    elif roi_pct >= 20 and payback_months is not None and payback_months <= 24:
+    elif roi_pct >= 20 and payback_years is not None and payback_years <= 2:
         decision = "Go"
         rationale = "The automation case is financially attractive with positive savings and a reasonable payback period."
-    elif roi_pct >= 0 and payback_months is not None and payback_months <= 36:
+    elif roi_pct >= 0 and payback_years is not None and payback_years <= 3:
         decision = "Review"
         rationale = "The case appears promising, but assumptions should be stress-tested before investment."
     else:
@@ -202,15 +325,89 @@ def calculate_financials(m: ManualProcessInputs, a: AutomationScenarioInputs, in
         **manual,
         **automated,
         "upfront_investment": upfront_investment,
+        "annual_operating_cost": a.annual_operating_cost,
         "roi_pct": roi_pct,
+        "payback_years": payback_years,
         "payback_months": payback_months,
         "npv": npv,
         "tco_manual": tco_manual,
         "tco_automated": tco_automated,
+        "tco_saving": full_model["tco_saving"],
+        "break_even_changes": full_model["break_even_changes"],
+        "saving_per_change": full_model["saving_per_change"],
+        "labour_manual_annual_cost": labour_model["manual_annual_cost"],
+        "labour_automated_annual_cost": labour_model["automated_annual_cost"],
+        "labour_gross_savings": labour_model["gross_process_savings"],
+        "labour_net_savings": labour_model["annual_savings"],
+        "labour_roi_pct": labour_model["roi_pct"],
+        "labour_payback_years": labour_model["payback_years"],
+        "labour_npv": labour_model["npv"],
+        "labour_tco_manual": labour_model["tco_manual"],
+        "labour_tco_automated": labour_model["tco_automated"],
+        "labour_tco_saving": labour_model["tco_saving"],
+        "labour_break_even_changes": labour_model["break_even_changes"],
         "decision": decision,
         "rationale": rationale,
         "cash_flows": cash_flows,
     }
+
+
+def scenario_inputs_from_name(name: str, workflow: str, data: str, approval: str) -> AutomationScenarioInputs:
+    values = SCENARIOS[name]
+    return AutomationScenarioInputs(
+        engineering_effort_reduction_pct=values["engineering_effort_reduction_pct"],
+        manager_effort_reduction_pct=values["manager_effort_reduction_pct"],
+        admin_effort_reduction_pct=values["admin_effort_reduction_pct"],
+        cycle_time_reduction_pct=values["cycle_time_reduction_pct"],
+        rework_reduction_pct=values["rework_reduction_pct"],
+        workflow_automation_level=workflow,
+        data_integration_level=data,
+        approval_automation_level=approval,
+        upfront_investment=values["upfront_investment"],
+        annual_operating_cost=values["annual_operating_cost"],
+    )
+
+
+def scenario_comparison_table(m: ManualProcessInputs, inv: InvestmentInputs, include_delay: bool) -> pd.DataFrame:
+    rows = []
+    for name in ["Conservative", "Base Case", "Optimistic"]:
+        scenario = scenario_inputs_from_name(
+            name,
+            st.session_state.workflow_automation_level,
+            st.session_state.data_integration_level,
+            st.session_state.approval_automation_level,
+        )
+        model = calculate_model(m, scenario, inv, include_delay=include_delay)
+        rows.append(
+            {
+                "Scenario": name,
+                "Manual annual cost": model["manual_annual_cost"],
+                "Automated annual cost": model["automated_annual_cost"],
+                "Annual savings": model["annual_savings"],
+                "ROI": model["roi_pct"],
+                "Payback": model["payback_years"],
+                "NPV": model["npv"],
+                "TCO saving": model["tco_saving"],
+                "Break-even changes/year": model["break_even_changes"],
+            }
+        )
+    return pd.DataFrame(rows).set_index("Scenario")
+
+
+def format_scenario_table(df: pd.DataFrame):
+    return df.style.format(
+        {
+            "Manual annual cost": "EUR {:,.0f}",
+            "Automated annual cost": "EUR {:,.0f}",
+            "Annual savings": "EUR {:,.0f}",
+            "ROI": "{:,.1f}%",
+            "Payback": "{:,.2f} years",
+            "NPV": "EUR {:,.0f}",
+            "TCO saving": "EUR {:,.0f}",
+            "Break-even changes/year": "{:,.0f}",
+        },
+        na_rep="N/A",
+    )
 
 
 def init_state() -> None:
@@ -233,6 +430,8 @@ page = st.sidebar.radio(
         "3. Investment Cost",
         "4. Results Comparison",
         "5. Sensitivity Analysis",
+        "6. Assumptions",
+        "7. Formula Explanation",
     ],
 )
 
@@ -244,45 +443,52 @@ st.sidebar.info(
 
 # Shared default inputs
 manual_defaults = {
-    "changes_per_year": 250,
-    "engineering_hours_per_change": 6.0,
-    "manager_hours_per_change": 1.5,
+    "changes_per_year": 500,
+    "engineering_hours_per_change": 10.0,
+    "manager_hours_per_change": 1.0,
     "admin_hours_per_change": 2.0,
-    "avg_cycle_time_days": 8.0,
-    "rework_rate_pct": 18.0,
-    "rework_hours_per_change": 3.0,
-    "delay_cost_per_day": 120.0,
-    "engineer_hourly_rate": 75.0,
-    "manager_hourly_rate": 95.0,
-    "admin_hourly_rate": 45.0,
+    "avg_cycle_time_days": 15.0,
+    "rework_rate_pct": 20.0,
+    "rework_hours_per_change": 4.0,
+    "delay_cost_per_day": 500.0,
+    "engineer_hourly_rate": 85.0,
+    "manager_hourly_rate": 100.0,
+    "admin_hourly_rate": 55.0,
 }
 
 automation_defaults = {
-    "engineering_effort_reduction_pct": 20.0,
-    "manager_effort_reduction_pct": 25.0,
-    "admin_effort_reduction_pct": 50.0,
-    "cycle_time_reduction_pct": 40.0,
-    "rework_reduction_pct": 30.0,
+    "scenario_name": "Base Case",
+    "engineering_effort_reduction_pct": 45.0,
+    "manager_effort_reduction_pct": 40.0,
+    "admin_effort_reduction_pct": 55.0,
+    "cycle_time_reduction_pct": 50.0,
+    "rework_reduction_pct": 40.0,
     "workflow_automation_level": "High",
     "data_integration_level": "Medium",
     "approval_automation_level": "High",
 }
 
 investment_defaults = {
-    "software_license_cost": 30000.0,
-    "implementation_cost": 45000.0,
-    "integration_cost": 25000.0,
-    "training_cost": 8000.0,
-    "internal_project_effort_cost": 15000.0,
-    "annual_maintenance_cost": 12000.0,
-    "analysis_horizon_years": 3,
-    "discount_rate_pct": 8.0,
+    "software_license_cost": 80000.0,
+    "implementation_cost": 120000.0,
+    "integration_cost": 50000.0,
+    "training_cost": 15000.0,
+    "internal_project_effort_cost": 30000.0,
+    "annual_maintenance_cost": 21600.0,
+    "internal_support_cost": 10000.0,
+    "analysis_horizon_years": 5,
+    "discount_rate_pct": 10.0,
 }
 
 # Use session state for continuity across pages
 for key, value in {**manual_defaults, **automation_defaults, **investment_defaults}.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+if st.session_state.scenario_name == "Base case":
+    st.session_state.scenario_name = "Base Case"
+if st.session_state.scenario_name not in ["Conservative", "Base Case", "Optimistic", "Custom"]:
+    st.session_state.scenario_name = "Base Case"
 
 
 # =============================
@@ -449,6 +655,21 @@ elif page == "2. Automation Scenario":
     st.write("Define the automation levers and expected process improvements for the future-state ECM process.")
     st.caption("All fields on this page are required for the current calculation logic.")
 
+    st.session_state.scenario_name = st.selectbox(
+        "Scenario",
+        ["Conservative", "Base Case", "Optimistic", "Custom"],
+        index=["Conservative", "Base Case", "Optimistic", "Custom"].index(st.session_state.scenario_name),
+        help="Predefined scenarios use Chapter 5 values. Custom allows manual editing.",
+    )
+    scenario_locked = st.session_state.scenario_name != "Custom"
+    if scenario_locked:
+        selected_scenario = SCENARIOS[st.session_state.scenario_name]
+        st.session_state.engineering_effort_reduction_pct = selected_scenario["engineering_effort_reduction_pct"]
+        st.session_state.manager_effort_reduction_pct = selected_scenario["manager_effort_reduction_pct"]
+        st.session_state.admin_effort_reduction_pct = selected_scenario["admin_effort_reduction_pct"]
+        st.session_state.cycle_time_reduction_pct = selected_scenario["cycle_time_reduction_pct"]
+        st.session_state.rework_reduction_pct = selected_scenario["rework_reduction_pct"]
+
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Improvement Assumptions")
@@ -583,6 +804,13 @@ elif page == "3. Investment Cost":
             step=1000.0,
             help="Recurring yearly cost for support, maintenance, licenses, or operation of the automation solution. Required field."
         )
+        st.session_state.internal_support_cost = st.number_input(
+            "Internal support cost (EUR)",
+            min_value=0.0,
+            value=float(st.session_state.internal_support_cost),
+            step=1000.0,
+            help="Recurring internal support cost included in annual system operating cost C_op. Required field."
+        )
         st.session_state.analysis_horizon_years = st.selectbox(
             "Analysis horizon (years)",
             [1, 3, 5],
@@ -598,17 +826,26 @@ elif page == "3. Investment Cost":
             help="Rate used to discount future savings when calculating NPV. Required field."
         )
 
-        upfront = (
-            st.session_state.software_license_cost
-            + st.session_state.implementation_cost
-            + st.session_state.integration_cost
-            + st.session_state.training_cost
-            + st.session_state.internal_project_effort_cost
+        current_inv = InvestmentInputs(
+            software_license_cost=st.session_state.software_license_cost,
+            implementation_cost=st.session_state.implementation_cost,
+            integration_cost=st.session_state.integration_cost,
+            training_cost=st.session_state.training_cost,
+            internal_project_effort_cost=st.session_state.internal_project_effort_cost,
+            annual_maintenance_cost=st.session_state.annual_maintenance_cost,
+            internal_support_cost=st.session_state.internal_support_cost,
+            analysis_horizon_years=st.session_state.analysis_horizon_years,
+            discount_rate_pct=st.session_state.discount_rate_pct,
         )
+        upfront = calculate_investment_total(current_inv)
+        operating_cost = calculate_operating_cost(current_inv)
+        if st.session_state.scenario_name != "Custom":
+            upfront = SCENARIOS[st.session_state.scenario_name]["upfront_investment"]
+            operating_cost = SCENARIOS[st.session_state.scenario_name]["annual_operating_cost"]
         st.markdown(
             f"<div style='background:#f8fafc;padding:16px;border-radius:12px;border:1px solid #e5e7eb;'>"
-            f"<strong>Total upfront investment:</strong> {eur(upfront)}<br>"
-            f"<strong>Annual maintenance:</strong> {eur(st.session_state.annual_maintenance_cost)}"
+            f"<strong>Effective I_0:</strong> {eur(upfront)}<br>"
+            f"<strong>Effective C_op:</strong> {eur(operating_cost)}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -631,17 +868,6 @@ manual_inputs = ManualProcessInputs(
     admin_hourly_rate=st.session_state.admin_hourly_rate,
 )
 
-automation_inputs = AutomationScenarioInputs(
-    engineering_effort_reduction_pct=st.session_state.engineering_effort_reduction_pct,
-    manager_effort_reduction_pct=st.session_state.manager_effort_reduction_pct,
-    admin_effort_reduction_pct=st.session_state.admin_effort_reduction_pct,
-    cycle_time_reduction_pct=st.session_state.cycle_time_reduction_pct,
-    rework_reduction_pct=st.session_state.rework_reduction_pct,
-    workflow_automation_level=st.session_state.workflow_automation_level,
-    data_integration_level=st.session_state.data_integration_level,
-    approval_automation_level=st.session_state.approval_automation_level,
-)
-
 investment_inputs = InvestmentInputs(
     software_license_cost=st.session_state.software_license_cost,
     implementation_cost=st.session_state.implementation_cost,
@@ -649,8 +875,50 @@ investment_inputs = InvestmentInputs(
     training_cost=st.session_state.training_cost,
     internal_project_effort_cost=st.session_state.internal_project_effort_cost,
     annual_maintenance_cost=st.session_state.annual_maintenance_cost,
+    internal_support_cost=st.session_state.internal_support_cost,
     analysis_horizon_years=st.session_state.analysis_horizon_years,
     discount_rate_pct=st.session_state.discount_rate_pct,
+)
+
+automation_inputs = AutomationScenarioInputs(
+    engineering_effort_reduction_pct=(
+        st.session_state.engineering_effort_reduction_pct
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["engineering_effort_reduction_pct"]
+    ),
+    manager_effort_reduction_pct=(
+        st.session_state.manager_effort_reduction_pct
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["manager_effort_reduction_pct"]
+    ),
+    admin_effort_reduction_pct=(
+        st.session_state.admin_effort_reduction_pct
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["admin_effort_reduction_pct"]
+    ),
+    cycle_time_reduction_pct=(
+        st.session_state.cycle_time_reduction_pct
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["cycle_time_reduction_pct"]
+    ),
+    rework_reduction_pct=(
+        st.session_state.rework_reduction_pct
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["rework_reduction_pct"]
+    ),
+    workflow_automation_level=st.session_state.workflow_automation_level,
+    data_integration_level=st.session_state.data_integration_level,
+    approval_automation_level=st.session_state.approval_automation_level,
+    upfront_investment=(
+        calculate_investment_total(investment_inputs)
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["upfront_investment"]
+    ),
+    annual_operating_cost=(
+        calculate_operating_cost(investment_inputs)
+        if st.session_state.scenario_name == "Custom"
+        else SCENARIOS[st.session_state.scenario_name]["annual_operating_cost"]
+    ),
 )
 
 results = calculate_financials(manual_inputs, automation_inputs, investment_inputs)
@@ -688,6 +956,40 @@ if page == "4. Results Comparison":
     ).set_index("Category")
     st.subheader("Financial comparison")
     st.bar_chart(compare_df)
+
+    st.subheader("Labour-only net model")
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("Manual labour-only cost", eur(results["labour_manual_annual_cost"]))
+    l2.metric("Automated labour-only cost", eur(results["labour_automated_annual_cost"]))
+    l3.metric("Labour-only net savings", eur(results["labour_net_savings"]))
+    l4.metric("Labour-only break-even", number_or_na(results["labour_break_even_changes"]))
+
+    labour_df = pd.DataFrame(
+        {
+            "Metric": [
+                "Gross labour/rework savings",
+                "Net labour-only savings",
+                "Labour-only ROI",
+                "Labour-only NPV",
+                "Labour-only TCO saving",
+            ],
+            "Value": [
+                eur(results["labour_gross_savings"]),
+                eur(results["labour_net_savings"]),
+                pct(results["labour_roi_pct"]),
+                eur(results["labour_npv"]),
+                eur(results["labour_tco_saving"]),
+            ],
+        }
+    )
+    st.dataframe(labour_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Scenario comparison")
+    st.caption("Conservative, Base Case, and Optimistic are recalculated with the same Chapter 5 formulas.")
+    st.write("Full model: labour, rework, delay, and C_op")
+    st.dataframe(format_scenario_table(scenario_comparison_table(manual_inputs, investment_inputs, include_delay=True)), use_container_width=True)
+    st.write("Labour-only net model: labour, rework, and C_op")
+    st.dataframe(format_scenario_table(scenario_comparison_table(manual_inputs, investment_inputs, include_delay=False)), use_container_width=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -727,12 +1029,13 @@ if page == "4. Results Comparison":
         )
 
     st.subheader("Manager interpretation")
+    payback_text = "N/A" if results["payback_months"] is None else f"{results['payback_months']:.1f} months"
     st.write(
         f"Under the current assumptions, the manual ECM process costs {eur(results['total_manual_cost'])} per year. "
         f"The automated scenario reduces annual operating cost to {eur(results['total_automated_operating_cost'])}, "
         f"creating annual savings of {eur(results['annual_savings'])}. The required upfront investment is "
         f"{eur(results['upfront_investment'])}, resulting in an ROI of {pct(results['roi_pct'])} and a payback period of "
-        f"{'N/A' if results['payback_months'] is None else f'{results['payback_months']:.1f} months'} over a {investment_inputs.analysis_horizon_years}-year horizon."
+        f"{payback_text} over a {investment_inputs.analysis_horizon_years}-year horizon."
     )
 
 
@@ -780,15 +1083,18 @@ if page == "5. Sensitivity Analysis":
         workflow_automation_level=automation_inputs.workflow_automation_level,
         data_integration_level=automation_inputs.data_integration_level,
         approval_automation_level=automation_inputs.approval_automation_level,
+        upfront_investment=float(sim_upfront_investment),
+        annual_operating_cost=automation_inputs.annual_operating_cost,
     )
 
     sim_inv = InvestmentInputs(
-        software_license_cost=float(sim_upfront_investment),
-        implementation_cost=0.0,
+        software_license_cost=0.0,
+        implementation_cost=float(sim_upfront_investment),
         integration_cost=0.0,
         training_cost=0.0,
         internal_project_effort_cost=0.0,
         annual_maintenance_cost=investment_inputs.annual_maintenance_cost,
+        internal_support_cost=investment_inputs.internal_support_cost,
         analysis_horizon_years=investment_inputs.analysis_horizon_years,
         discount_rate_pct=investment_inputs.discount_rate_pct,
     )
@@ -819,4 +1125,74 @@ if page == "5. Sensitivity Analysis":
         f"With {sim_changes} changes per year, a cycle-time reduction of {sim_cycle_reduction}%, and an upfront investment of "
         f"{eur(sim_upfront_investment)}, the model produces {eur(sim_results['annual_savings'])} in annual savings. "
         f"This results in {pct(sim_results['roi_pct'])} ROI and a decision of **{sim_results['decision']}**."
+    )
+
+
+# =============================
+# Page 6: Assumptions
+# =============================
+if page == "6. Assumptions":
+    st.title("Assumptions")
+    st.write("Explain how the Chapter 5 ROI model should be interpreted.")
+
+    assumptions_df = pd.DataFrame(
+        [
+            ("Purpose", "The app is a decision-support prototype for measuring ROI of ECM automation."),
+            ("Not a PLM system", "The app does not execute engineering changes, route approvals, or optimise workflows."),
+            ("Full model", "Includes engineering, manager, admin, rework, delay cost, I_0, and C_op."),
+            ("Labour-only net model", "Excludes delay cost but includes C_op, so annual operating cost is not ignored."),
+            ("Delay cost", "Delay cost is the most uncertain parameter and should be validated with company-specific data."),
+            ("Illustrative values", "Default values support the thesis model and can be replaced with company-specific ECM data."),
+        ],
+        columns=["Topic", "Explanation"],
+    )
+    st.dataframe(assumptions_df, use_container_width=True, hide_index=True)
+
+
+# =============================
+# Page 7: Formula Explanation
+# =============================
+if page == "7. Formula Explanation":
+    st.title("Formula Explanation")
+    st.write("Plain-English formulas used in the Chapter 5 calculation model.")
+
+    formulas_df = pd.DataFrame(
+        [
+            ("I_0", "implementation cost + integration cost + training cost + internal project effort cost"),
+            ("C_op", "software license cost + annual maintenance cost + internal support cost"),
+            ("Manual annual full cost", "engineering + manager + admin + rework + delay"),
+            ("Automated annual full cost", "reduced engineering + reduced manager + reduced admin + reduced rework + reduced delay + C_op"),
+            ("Manual labour-only cost", "engineering + manager + admin + rework"),
+            ("Automated labour-only cost", "reduced engineering + reduced manager + reduced admin + reduced rework + C_op"),
+            ("Annual savings", "manual annual cost - automated annual cost"),
+            ("ROI", "((S_annual x analysis horizon) - I_0) / I_0 x 100"),
+            ("Payback", "I_0 / S_annual"),
+            ("NPV", "-I_0 + S_annual x annuity factor"),
+            ("Annuity factor", "(1 - (1+r)^(-T_h)) / r"),
+            ("TCO manual", "manual annual cost x analysis horizon"),
+            ("TCO automated", "I_0 + automated annual cost x analysis horizon"),
+            ("Break-even changes/year", "(I_0 + C_op x annuity factor) / (saving per change x annuity factor)"),
+        ],
+        columns=["Metric", "Formula"],
+    )
+    st.dataframe(formulas_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Current Base Case check")
+    base_case = scenario_inputs_from_name(
+        "Base Case",
+        st.session_state.workflow_automation_level,
+        st.session_state.data_integration_level,
+        st.session_state.approval_automation_level,
+    )
+    base_full = calculate_model(manual_inputs, base_case, investment_inputs, include_delay=True)
+    base_labour = calculate_model(manual_inputs, base_case, investment_inputs, include_delay=False)
+    st.write(
+        f"Full model Base Case: manual annual cost {eur(base_full['manual_annual_cost'])}, "
+        f"automated annual cost {eur(base_full['automated_annual_cost'])}, "
+        f"annual savings {eur(base_full['annual_savings'])}, NPV {eur(base_full['npv'])}, "
+        f"ROI {pct(base_full['roi_pct'])}."
+    )
+    st.write(
+        f"Labour-only net Base Case: annual savings {eur(base_labour['annual_savings'])}, "
+        f"NPV {eur(base_labour['npv'])}, break-even {number_or_na(base_labour['break_even_changes'])} changes/year."
     )
