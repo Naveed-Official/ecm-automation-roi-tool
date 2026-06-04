@@ -384,7 +384,7 @@ def scenario_comparison_table(m: ManualProcessInputs, inv: InvestmentInputs, inc
                 "Manual annual cost": model["manual_annual_cost"],
                 "Automated annual cost": model["automated_annual_cost"],
                 "Annual savings": model["annual_savings"],
-                "ROI": model["roi_pct"],
+                "Cumulative ROI": model["roi_pct"],
                 "Payback": model["payback_years"],
                 "NPV": model["npv"],
                 "TCO saving": model["tco_saving"],
@@ -400,7 +400,7 @@ def format_scenario_table(df: pd.DataFrame):
             "Manual annual cost": "EUR {:,.0f}",
             "Automated annual cost": "EUR {:,.0f}",
             "Annual savings": "EUR {:,.0f}",
-            "ROI": "{:,.1f}%",
+            "Cumulative ROI": "{:,.1f}%",
             "Payback": "{:,.2f} years",
             "NPV": "EUR {:,.0f}",
             "TCO saving": "EUR {:,.0f}",
@@ -509,7 +509,7 @@ It then calculates key business metrics such as:
 - annual manual process cost
 - annual automated process cost
 - annual savings
-- ROI
+- cumulative ROI over the selected analysis horizon
 - payback period
 - NPV and TCO
 
@@ -938,7 +938,7 @@ if page == "4. Results Comparison":
     k4.metric("Upfront investment", eur(results["upfront_investment"]))
 
     k5, k6, k7, k8 = st.columns(4)
-    k5.metric("ROI", pct(results["roi_pct"]))
+    k5.metric(f"{investment_inputs.analysis_horizon_years}-year cumulative ROI", pct(results["roi_pct"]))
     k6.metric("Payback", "N/A" if results["payback_months"] is None else f"{results['payback_months']:.1f} mo")
     k7.metric("NPV", eur(results["npv"]))
     k8.metric("Decision", results["decision"])
@@ -969,7 +969,7 @@ if page == "4. Results Comparison":
             "Metric": [
                 "Gross labour/rework savings",
                 "Net labour-only savings",
-                "Labour-only ROI",
+                "Labour-only cumulative ROI",
                 "Labour-only NPV",
                 "Labour-only TCO saving",
             ],
@@ -1034,7 +1034,7 @@ if page == "4. Results Comparison":
         f"Under the current assumptions, the manual ECM process costs {eur(results['total_manual_cost'])} per year. "
         f"The automated scenario reduces annual operating cost to {eur(results['total_automated_operating_cost'])}, "
         f"creating annual savings of {eur(results['annual_savings'])}. The required upfront investment is "
-        f"{eur(results['upfront_investment'])}, resulting in an ROI of {pct(results['roi_pct'])} and a payback period of "
+        f"{eur(results['upfront_investment'])}, resulting in a cumulative ROI over the selected analysis horizon of {pct(results['roi_pct'])} and a payback period of "
         f"{payback_text} over a {investment_inputs.analysis_horizon_years}-year horizon."
     )
 
@@ -1103,7 +1103,7 @@ if page == "5. Sensitivity Analysis":
 
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Simulated annual savings", eur(sim_results["annual_savings"]))
-    s2.metric("Simulated ROI", pct(sim_results["roi_pct"]))
+    s2.metric("Simulated cumulative ROI", pct(sim_results["roi_pct"]))
     s3.metric("Simulated payback", "N/A" if sim_results["payback_months"] is None else f"{sim_results['payback_months']:.1f} mo")
     s4.metric("Decision", sim_results["decision"])
 
@@ -1124,7 +1124,7 @@ if page == "5. Sensitivity Analysis":
     st.write(
         f"With {sim_changes} changes per year, a cycle-time reduction of {sim_cycle_reduction}%, and an upfront investment of "
         f"{eur(sim_upfront_investment)}, the model produces {eur(sim_results['annual_savings'])} in annual savings. "
-        f"This results in {pct(sim_results['roi_pct'])} ROI and a decision of **{sim_results['decision']}**."
+        f"This results in {pct(sim_results['roi_pct'])} cumulative ROI and a decision of **{sim_results['decision']}**."
     )
 
 
@@ -1165,7 +1165,7 @@ if page == "7. Formula Explanation":
             ("Manual labour-only cost", "engineering + manager + admin + rework"),
             ("Automated labour-only cost", "reduced engineering + reduced manager + reduced admin + reduced rework + C_op"),
             ("Annual savings", "manual annual cost - automated annual cost"),
-            ("ROI", "((S_annual x analysis horizon) - I_0) / I_0 x 100"),
+            ("Cumulative ROI over selected horizon", "((S_annual x analysis horizon) - I_0) / I_0 x 100"),
             ("Payback", "I_0 / S_annual"),
             ("NPV", "-I_0 + S_annual x annuity factor"),
             ("Annuity factor", "(1 - (1+r)^(-T_h)) / r"),
@@ -1190,7 +1190,7 @@ if page == "7. Formula Explanation":
         f"Full model Base Case: manual annual cost {eur(base_full['manual_annual_cost'])}, "
         f"automated annual cost {eur(base_full['automated_annual_cost'])}, "
         f"annual savings {eur(base_full['annual_savings'])}, NPV {eur(base_full['npv'])}, "
-        f"ROI {pct(base_full['roi_pct'])}."
+        f"cumulative ROI {pct(base_full['roi_pct'])}."
     )
     st.write(
         f"Labour-only net Base Case: annual savings {eur(base_labour['annual_savings'])}, "
